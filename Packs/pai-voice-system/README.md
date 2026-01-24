@@ -1,9 +1,9 @@
 ---
 name: PAI Voice System
-pack-id: danielmiessler-pai-voice-system-v1.0.1
-version: 1.0.1
+pack-id: danielmiessler-pai-voice-system-v1.1.0
+version: 1.1.0
 author: danielmiessler
-description: Voice notification system with ElevenLabs TTS, prosody enhancement for natural speech, and agent personality-driven voice delivery
+description: Voice notification system with dual TTS backends (free edge-tts + premium ElevenLabs), prosody enhancement, and agent personality-driven voice delivery
 type: feature
 purpose-type: [notifications, accessibility, automation]
 platform: macos
@@ -38,7 +38,8 @@ keywords: [voice, tts, elevenlabs, notifications, prosody, speech, agents, perso
 ## What This Pack Provides
 
 - **Spoken Notifications**: Hear task completions via text-to-speech
-- **ElevenLabs TTS**: High-quality voice synthesis via ElevenLabs API
+- **Dual TTS Backends**: Free edge-tts (Microsoft neural voices) or premium ElevenLabs
+- **Automatic Fallback**: ElevenLabs failures (401/429/quota) seamlessly fall back to edge-tts
 - **Prosody Enhancement**: Natural speech patterns with 13 emotional markers
 - **Agent Personalities**: Different voices for different agent types
 - **Intelligent Cleaning**: Strips code blocks and artifacts for clean speech
@@ -74,20 +75,34 @@ curl -X POST http://localhost:8888/notify \
 ┌─────────────────┐      ┌──────────────────┐      ┌─────────────────┐
 │   Stop Hook     │ ───► │  Voice Server    │ ───► │  ElevenLabs     │
 │ (extracts msg)  │      │  (localhost:8888)│      │  TTS API        │
-└─────────────────┘      └──────────────────┘      └─────────────────┘
-        │                         │
+└─────────────────┘      └──────────────────┘      │    (premium)    │
+        │                         │                 └────────┬────────┘
+        │                         │                          │
+        │                         │    ┌─────────────────┐   │ fallback
+        │                         ├───►│  edge-tts       │◄──┘ on error
+        │                         │    │  (free, no key) │
+        │                         │    └─────────────────┘
         │                         ▼
         │                ┌─────────────────┐
         │                │  Audio Player   │
         │                │  (afplay)       │
         │                └─────────────────┘
-        │
         ▼
 ┌─────────────────┐
 │ Response Format │
 │ 🗣️ [AI_NAME]:  │
 └─────────────────┘
 ```
+
+### TTS Backend Selection
+
+| Backend | Cost | Quality | API Key | Fallback |
+|---------|------|---------|---------|----------|
+| `edge-tts` (default) | Free | Good (Microsoft neural) | Not needed | N/A |
+| `elevenlabs` | Paid | Premium | Required | Auto-fallback to edge-tts |
+
+Set via `TTS_BACKEND` environment variable. When using ElevenLabs, the server automatically
+falls back to edge-tts on 401 (unauthorized), 429 (rate limit), or quota exhaustion errors.
 
 ## Response Format Integration
 
@@ -128,7 +143,7 @@ The hook extracts this line, enhances it with prosody markers, and sends it to t
 - **Files created:** 6
 - **Hooks registered:** 2 (Stop, SubagentStop)
 - **Dependencies:** pai-hook-system (required), pai-core-install (required)
-- **TTS API key:** ElevenLabs API key required
+- **TTS backends:** edge-tts (free, default) or ElevenLabs (premium, optional)
 
 ## Emotional Detection
 
@@ -152,11 +167,49 @@ These markers are embedded in the message and the voice server adjusts stability
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `ELEVENLABS_API_KEY` | Yes | - | Your ElevenLabs API key |
-| `ELEVENLABS_VOICE_ID` | Yes | - | Default voice ID for TTS |
+| `TTS_BACKEND` | No | `edge-tts` | TTS backend: `edge-tts` (free) or `elevenlabs` (premium) |
+| `EDGE_TTS_VOICE` | No | `en-GB-RyanNeural` | Default edge-tts voice |
+| `ELEVENLABS_API_KEY` | For elevenlabs | - | Your ElevenLabs API key |
+| `ELEVENLABS_VOICE_ID` | For elevenlabs | - | Default ElevenLabs voice ID |
 | `VOICE_SERVER_PORT` | No | 8888 | Voice server port |
 | `VOICE_SERVER_URL` | No | http://localhost:8888 | Voice server URL (for hooks) |
 | `PAI_DIR` | No | ~/.config/pai | PAI installation directory |
+
+### Quick Start (Free, No API Key)
+
+```bash
+# Install edge-tts
+pipx install edge-tts
+
+# Start the server (uses edge-tts by default)
+bun run src/voice/server.ts
+
+# Test it
+curl -X POST http://localhost:8888/notify \
+  -H "Content-Type: application/json" \
+  -d '{"message": "Hello from PAI voice system"}'
+```
+
+### Available edge-tts Voices
+
+List all available voices:
+```bash
+edge-tts --list-voices
+```
+
+Pre-configured voices per agent personality (in `voice-personalities.json`):
+
+| Agent | Voice | Gender | Accent |
+|-------|-------|--------|--------|
+| PAI | en-GB-RyanNeural | Male | British |
+| Intern | en-US-BrianNeural | Male | American |
+| Engineer | en-US-GuyNeural | Male | American |
+| Architect | en-GB-ThomasNeural | Male | British |
+| Researcher | en-US-AvaNeural | Female | American |
+| Designer | en-US-AriaNeural | Female | American |
+| Artist | en-US-EmmaNeural | Female | American |
+| Pentester | en-GB-ThomasNeural | Male | British |
+| Writer | en-GB-LibbyNeural | Female | British |
 
 ## Agent Voice Mapping
 
@@ -194,6 +247,15 @@ Configure multiple voices in `voice-personalities.json` for multi-agent conversa
 - **pai-history-system** - Complementary functionality
 
 ## Changelog
+
+### 1.1.0 - 2026-01-24
+- **Added edge-tts backend**: Free Microsoft neural TTS voices, no API key required
+- New `TTS_BACKEND` environment variable (`edge-tts` or `elevenlabs`)
+- Automatic fallback from ElevenLabs to edge-tts on API errors (401/429/quota)
+- Added `edge_tts_voice` field to all voice personality entries
+- edge-tts is now the default backend (works out of the box, zero configuration)
+- Updated `/health` endpoint to report active backend
+- Prerequisite: `pipx install edge-tts`
 
 ### 1.0.1 - 2026-01-09
 - **Documentation fixes**: INSTALL.md and VERIFY.md now correctly reference actual files

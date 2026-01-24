@@ -1,6 +1,13 @@
 #!/usr/bin/env bun
 /**
- * PAI Voice Server - Text-to-Speech notification server using ElevenLabs
+ * PAI Voice Server - Text-to-Speech notification server
+ *
+ * Supports two TTS backends:
+ *   - edge-tts: Free Microsoft neural voices (no API key needed)
+ *   - elevenlabs: ElevenLabs API (premium quality, requires API key)
+ *
+ * When using ElevenLabs, the server automatically falls back to edge-tts
+ * on API errors (401, 429, quota exhaustion), ensuring the system always speaks.
  *
  * Part of the pai-voice-system pack.
  *
@@ -8,8 +15,10 @@
  *   bun run src/voice/server.ts
  *
  * Environment Variables:
- *   ELEVENLABS_API_KEY - Your ElevenLabs API key (required)
- *   ELEVENLABS_VOICE_ID - Default voice ID (optional)
+ *   TTS_BACKEND - TTS backend: "edge-tts" (default) or "elevenlabs"
+ *   EDGE_TTS_VOICE - Default edge-tts voice (default: en-GB-RyanNeural)
+ *   ELEVENLABS_API_KEY - Your ElevenLabs API key (required for elevenlabs backend)
+ *   ELEVENLABS_VOICE_ID - Default ElevenLabs voice ID (optional)
  *   VOICE_SERVER_PORT - Server port (default: 8888)
  *   PAI_DIR - PAI installation directory (default: ~/.config/pai)
  *
@@ -41,26 +50,31 @@ const PORT = parseInt(process.env.VOICE_SERVER_PORT || process.env.PORT || "8888
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
 const PAI_DIR = process.env.PAI_DIR || join(homedir(), '.config', 'pai');
 
-if (!ELEVENLABS_API_KEY) {
-  console.error('⚠️  ELEVENLABS_API_KEY not found in ~/.env');
-  console.error('Add: ELEVENLABS_API_KEY=your_key_here');
+// TTS Backend configuration
+const TTS_BACKEND = (process.env.TTS_BACKEND || 'edge-tts') as 'edge-tts' | 'elevenlabs';
+const DEFAULT_EDGE_VOICE = process.env.EDGE_TTS_VOICE || 'en-GB-RyanNeural';
+
+// Resolve edge-tts binary path (pipx installs to ~/.local/bin)
+const EDGE_TTS_BIN = existsSync(join(homedir(), '.local', 'bin', 'edge-tts'))
+  ? join(homedir(), '.local', 'bin', 'edge-tts')
+  : 'edge-tts'; // Fallback to PATH lookup
+
+if (TTS_BACKEND === 'elevenlabs' && !ELEVENLABS_API_KEY) {
+  console.warn('⚠️  TTS_BACKEND=elevenlabs but ELEVENLABS_API_KEY not found — will fallback to edge-tts');
 }
 
 // Default voice ID - configure via environment variable
 const DEFAULT_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || "";
 
-if (!DEFAULT_VOICE_ID) {
-  console.warn('⚠️  ELEVENLABS_VOICE_ID not set - voice requests will fail without explicit voice_id');
-}
-
 // Voice configuration types
 interface VoiceConfig {
   voice_id: string;
   voice_name: string;
+  edge_tts_voice?: string;
   stability: number;
   similarity_boost: number;
   description: string;
-  type: string;
+  type?: string;
 }
 
 interface VoicesConfig {
@@ -117,11 +131,11 @@ try {
     }
   } else {
     // Fallback to local voices.json
-    const voicesPath = join(import.meta.dir, '..', '..', 'voice-personalities.json');
+    const voicesPath = join(import.meta.dir, '..', '..', 'config', 'voice-personalities.json');
     if (existsSync(voicesPath)) {
       const voicesContent = readFileSync(voicesPath, 'utf-8');
       voicesConfig = JSON.parse(voicesContent);
-      console.log('✅ Loaded from voice-personalities.json');
+      console.log('✅ Loaded from config/voice-personalities.json');
     }
   }
 } catch (error) {
@@ -230,7 +244,7 @@ function validateInput(input: any): { valid: boolean; error?: string; sanitized?
 }
 
 // Generate speech using ElevenLabs API
-async function generateSpeech(
+async function generateSpeechElevenLabs(
   text: string,
   voiceId: string,
   voiceSettings?: { stability: number; similarity_boost: number }
@@ -264,10 +278,62 @@ async function generateSpeech(
 
   if (!response.ok) {
     const errorText = await response.text();
-    throw new Error(`ElevenLabs API error: ${response.status} - ${errorText}`);
+    const err = new Error(`ElevenLabs API error: ${response.status} - ${errorText}`);
+    (err as any).status = response.status;
+    throw err;
   }
 
   return await response.arrayBuffer();
+}
+
+// Generate speech using edge-tts CLI (free, zero-API-key)
+async function generateSpeechEdgeTTS(
+  text: string,
+  edgeVoice: string
+): Promise<ArrayBuffer> {
+  const tempFile = `/tmp/edge-tts-${Date.now()}.mp3`;
+  const proc = Bun.spawn([
+    EDGE_TTS_BIN,
+    '--text', text,
+    '--voice', edgeVoice,
+    '--write-media', tempFile
+  ]);
+  await proc.exited;
+  if (proc.exitCode !== 0) {
+    throw new Error(`edge-tts exited with code ${proc.exitCode}`);
+  }
+  const buffer = await Bun.file(tempFile).arrayBuffer();
+  await Bun.spawn(['rm', tempFile]).exited;
+  return buffer;
+}
+
+// Dispatch to the configured TTS backend with ElevenLabs → edge-tts fallback
+async function synthesizeSpeech(
+  text: string,
+  voiceConfig: VoiceConfig | null,
+  voiceId: string,
+  voiceSettings?: { stability: number; similarity_boost: number }
+): Promise<ArrayBuffer> {
+  const edgeVoice = voiceConfig?.edge_tts_voice || DEFAULT_EDGE_VOICE;
+
+  if (TTS_BACKEND === 'edge-tts') {
+    console.log(`🔊 Using edge-tts (voice: ${edgeVoice})`);
+    return generateSpeechEdgeTTS(text, edgeVoice);
+  }
+
+  // ElevenLabs with automatic fallback to edge-tts
+  try {
+    return await generateSpeechElevenLabs(text, voiceId, voiceSettings);
+  } catch (err: any) {
+    const status = err?.status;
+    const msg = err?.message || '';
+    if (status === 401 || status === 429 || status === 402 ||
+        msg.includes('quota') || msg.includes('limit')) {
+      console.log(`[VoiceServer] ElevenLabs failed (${status || msg}), falling back to edge-tts (${edgeVoice})`);
+      return generateSpeechEdgeTTS(text, edgeVoice);
+    }
+    throw err;
+  }
 }
 
 // Get volume setting from config (defaults to 1.0 = 100%)
@@ -359,23 +425,19 @@ async function sendNotification(
   const { cleaned, emotion } = extractEmotionalMarker(safeMessage);
   safeMessage = cleaned;
 
-  // Generate and play voice using ElevenLabs
-  if (voiceEnabled && ELEVENLABS_API_KEY) {
+  // Generate and play voice using configured backend
+  if (voiceEnabled) {
     try {
       const voice = voiceId || DEFAULT_VOICE_ID;
-
-      // Get voice configuration (personality settings)
       const voiceConfig = getVoiceConfig(voice);
 
       // Determine voice settings (priority: emotional > personality > defaults)
       let voiceSettings = { stability: 0.5, similarity_boost: 0.5 };
 
       if (emotion && EMOTIONAL_PRESETS[emotion]) {
-        // Emotional marker overrides personality
         voiceSettings = EMOTIONAL_PRESETS[emotion];
         console.log(`🎭 Emotion: ${emotion}`);
       } else if (voiceConfig) {
-        // Use personality settings from voices config
         voiceSettings = {
           stability: voiceConfig.stability,
           similarity_boost: voiceConfig.similarity_boost
@@ -383,9 +445,9 @@ async function sendNotification(
         console.log(`👤 Personality: ${voiceConfig.description}`);
       }
 
-      console.log(`🎙️  Generating speech (voice: ${voice}, stability: ${voiceSettings.stability}, boost: ${voiceSettings.similarity_boost})`);
+      console.log(`🎙️  Generating speech (backend: ${TTS_BACKEND}, voice: ${voice})`);
 
-      const audioBuffer = await generateSpeech(safeMessage, voice, voiceSettings);
+      const audioBuffer = await synthesizeSpeech(safeMessage, voiceConfig, voice, voiceSettings);
       await playAudio(audioBuffer);
     } catch (error) {
       console.error("Failed to generate/play speech:", error);
@@ -525,7 +587,8 @@ const server = serve({
         JSON.stringify({
           status: "healthy",
           port: PORT,
-          voice_system: "ElevenLabs",
+          tts_backend: TTS_BACKEND,
+          default_edge_voice: DEFAULT_EDGE_VOICE,
           default_voice_id: DEFAULT_VOICE_ID || "(not configured)",
           api_key_configured: !!ELEVENLABS_API_KEY,
           pai_dir: PAI_DIR
@@ -545,8 +608,10 @@ const server = serve({
 });
 
 console.log(`🚀 PAI Voice Server running on port ${PORT}`);
-console.log(`🎙️  Using ElevenLabs TTS`);
-console.log(`🔊 Default voice: ${DEFAULT_VOICE_ID || '(not configured - set ELEVENLABS_VOICE_ID)'}`);
+console.log(`🎙️  TTS Backend: ${TTS_BACKEND}${TTS_BACKEND === 'edge-tts' ? ` (voice: ${DEFAULT_EDGE_VOICE})` : ''}`);
+if (TTS_BACKEND === 'elevenlabs') {
+  console.log(`🔊 ElevenLabs voice: ${DEFAULT_VOICE_ID || '(not configured - set ELEVENLABS_VOICE_ID)'}`);
+  console.log(`🔑 API Key: ${ELEVENLABS_API_KEY ? '✅ Configured' : '❌ Missing (will fallback to edge-tts)'}`);
+}
 console.log(`📡 POST to http://localhost:${PORT}/notify`);
 console.log(`🔒 Security: CORS restricted to localhost, rate limiting enabled`);
-console.log(`🔑 API Key: ${ELEVENLABS_API_KEY ? '✅ Configured' : '❌ Missing'}`);
