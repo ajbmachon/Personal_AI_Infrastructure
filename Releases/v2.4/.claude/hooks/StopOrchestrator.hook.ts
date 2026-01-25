@@ -56,9 +56,9 @@
 import { parseTranscript } from '../skills/CORE/Tools/TranscriptParser';
 import { handleVoice } from './handlers/VoiceNotification';
 import { handleCapture } from './handlers/ResponseCapture';
-import { handleTabState } from './handlers/TabState';
+// import { handleTabState } from './handlers/TabState';  // DISABLED: causes visual spam during inference
 import { handleSystemIntegrity } from './handlers/SystemIntegrity';
-import { handleISCValidation } from './handlers/ISCValidator';
+// import { handleISCValidation } from './handlers/ISCValidator';  // DISABLED: uses inference
 
 interface HookInput {
   session_id: string;
@@ -109,37 +109,34 @@ async function main() {
   console.error(`[StopOrchestrator] Parsed transcript: ${parsed.plainCompletion.slice(0, 50)}...`);
 
   // Run non-blocking handlers first
-  const [voiceResult, captureResult, tabResult, integrityResult] = await Promise.allSettled([
+  // NOTE: TabState disabled - causes visual spam during inference (issue #16002)
+  // NOTE: ISCValidation disabled - uses inference which triggers TUI re-renders
+  const [voiceResult, captureResult, integrityResult] = await Promise.allSettled([
     handleVoice(parsed, hookInput.session_id),
     handleCapture(parsed, hookInput),
-    handleTabState(parsed),
+    // handleTabState(parsed),  // DISABLED
     handleSystemIntegrity(parsed, hookInput),
   ]);
 
   // Log any handler failures
-  const handlerNames = ['Voice', 'Capture', 'TabState', 'SystemIntegrity'];
-  [voiceResult, captureResult, tabResult, integrityResult].forEach((result, index) => {
+  const handlerNames = ['Voice', 'Capture', 'SystemIntegrity'];
+  [voiceResult, captureResult, integrityResult].forEach((result, index) => {
     if (result.status === 'rejected') {
       console.error(`[StopOrchestrator] ${handlerNames[index]} handler failed:`, result.reason);
     }
   });
 
-  // Run ISC validation (potentially blocking)
-  try {
-    const iscResult = await handleISCValidation(parsed, hookInput);
-
-    if (iscResult.shouldBlock && iscResult.blockReason) {
-      // Output blocking decision to stdout (Claude Code reads this)
-      console.log(JSON.stringify({
-        decision: 'block',
-        reason: iscResult.blockReason,
-      }));
-      console.error('[StopOrchestrator] ISC validation BLOCKED response');
-      process.exit(0);
-    }
-  } catch (err) {
-    console.error('[StopOrchestrator] ISCValidator handler failed:', err);
-  }
+  // ISC validation disabled - uses inference which causes TUI re-render spam
+  // try {
+  //   const iscResult = await handleISCValidation(parsed, hookInput);
+  //   if (iscResult.shouldBlock && iscResult.blockReason) {
+  //     console.log(JSON.stringify({ decision: 'block', reason: iscResult.blockReason }));
+  //     console.error('[StopOrchestrator] ISC validation BLOCKED response');
+  //     process.exit(0);
+  //   }
+  // } catch (err) {
+  //   console.error('[StopOrchestrator] ISCValidator handler failed:', err);
+  // }
 
   process.exit(0);
 }

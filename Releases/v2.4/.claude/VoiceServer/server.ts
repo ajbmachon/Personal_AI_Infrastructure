@@ -70,6 +70,27 @@ if (!daVoiceId) {
 // Default voice ID from settings.json or environment variable
 const DEFAULT_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || daVoiceId || "";
 
+// Load settings.json for voiceServer config (edge-tts backend selection)
+interface VoiceServerSettings {
+  ttsBackend?: 'edge-tts' | 'elevenlabs';
+  edgeTtsVoice?: string;
+}
+
+let voiceServerSettings: VoiceServerSettings = {};
+try {
+  const settingsPath = join(homedir(), '.claude', 'settings.json');
+  if (existsSync(settingsPath)) {
+    const settings = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+    voiceServerSettings = settings.voiceServer || {};
+  }
+} catch (error) {
+  console.warn('⚠️  Failed to load settings.json voiceServer config, using defaults');
+}
+
+const TTS_BACKEND = voiceServerSettings.ttsBackend || 'edge-tts';
+const DEFAULT_EDGE_VOICE = voiceServerSettings.edgeTtsVoice || 'en-GB-RyanNeural';
+const EDGE_TTS_BIN = join(homedir(), '.local', 'bin', 'edge-tts');
+
 // Voice configuration types
 interface ProsodySettings {
   stability: number;
@@ -83,6 +104,7 @@ interface ProsodySettings {
 interface VoiceConfig {
   voice_id: string;
   voice_name: string;
+  edge_tts_voice?: string;  // Free edge-tts voice mapping
   stability: number;
   similarity_boost: number;
   style?: number;
@@ -261,6 +283,55 @@ async function generateSpeech(
   return await response.arrayBuffer();
 }
 
+// Generate speech using edge-tts CLI (free, zero-API-key)
+async function generateSpeechEdgeTTS(
+  text: string,
+  edgeVoice: string
+): Promise<ArrayBuffer> {
+  const tempFile = `/tmp/edge-tts-${Date.now()}.mp3`;
+  const proc = Bun.spawn([
+    EDGE_TTS_BIN,
+    '--text', text,
+    '--voice', edgeVoice,
+    '--write-media', tempFile
+  ]);
+  await proc.exited;
+  if (proc.exitCode !== 0) {
+    throw new Error(`edge-tts exited with code ${proc.exitCode}`);
+  }
+  const buffer = await Bun.file(tempFile).arrayBuffer();
+  await Bun.spawn(['rm', tempFile]).exited;
+  return buffer;
+}
+
+// Dispatch to configured TTS backend with fallback
+async function synthesizeSpeech(
+  text: string,
+  voiceConfig: VoiceConfig | null,
+  voiceId: string,
+  prosody?: Partial<ProsodySettings>
+): Promise<ArrayBuffer> {
+  const edgeVoice = voiceConfig?.edge_tts_voice || DEFAULT_EDGE_VOICE;
+
+  if (TTS_BACKEND === 'edge-tts') {
+    console.log(`🔊 Using edge-tts (voice: ${edgeVoice})`);
+    return generateSpeechEdgeTTS(text, edgeVoice);
+  }
+
+  // ElevenLabs with fallback to edge-tts
+  try {
+    return await generateSpeech(text, voiceId, prosody);
+  } catch (err: any) {
+    const status = err?.status || err?.response?.status;
+    const msg = err?.message || '';
+    if (status === 401 || status === 429 || msg.includes('quota') || msg.includes('402')) {
+      console.log(`[VoiceServer] ElevenLabs failed (${status || msg}), falling back to edge-tts`);
+      return generateSpeechEdgeTTS(text, edgeVoice);
+    }
+    throw err;
+  }
+}
+
 // Get volume setting from DA config or request (defaults to 1.0 = 100%)
 function getVolumeSetting(requestVolume?: number): number {
   // Request volume takes priority
@@ -393,7 +464,7 @@ async function sendNotification(
       console.log(`🎙️  Generating speech (voice: ${voice}, stability: ${settings.stability}, style: ${settings.style}, speed: ${settings.speed}, volume: ${volume ?? 1.0})`);
 
       const spokenMessage = applyPronunciations(safeMessage);
-        const audioBuffer = await generateSpeech(spokenMessage, voice, prosody);
+      const audioBuffer = await synthesizeSpeech(spokenMessage, voiceConfig, voice, prosody);
       await playAudio(audioBuffer, volume);
     } catch (error) {
       console.error("Failed to generate/play speech:", error);
@@ -538,8 +609,9 @@ const server = serve({
         JSON.stringify({
           status: "healthy",
           port: PORT,
-          voice_system: "ElevenLabs",
+          tts_backend: TTS_BACKEND,
           default_voice_id: DEFAULT_VOICE_ID,
+          default_edge_voice: DEFAULT_EDGE_VOICE,
           api_key_configured: !!ELEVENLABS_API_KEY
         }),
         {
@@ -557,7 +629,9 @@ const server = serve({
 });
 
 console.log(`🚀 Voice Server running on port ${PORT}`);
-console.log(`🎙️  Using ElevenLabs TTS (default voice: ${DEFAULT_VOICE_ID})`);
+console.log(`🎙️  TTS Backend: ${TTS_BACKEND} (edge-tts voice: ${DEFAULT_EDGE_VOICE})`);
+if (TTS_BACKEND === 'elevenlabs') {
+  console.log(`🔑 ElevenLabs API Key: ${ELEVENLABS_API_KEY ? '✅ Configured' : '❌ Missing (will fallback to edge-tts)'}`);
+}
 console.log(`📡 POST to http://localhost:${PORT}/notify`);
 console.log(`🔒 Security: CORS restricted to localhost, rate limiting enabled`);
-console.log(`🔑 API Key: ${ELEVENLABS_API_KEY ? '✅ Configured' : '❌ Missing'}`);
